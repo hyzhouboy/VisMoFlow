@@ -66,7 +66,7 @@ Stage 1: Initialize our model for frame-based scene flow using KITTI dataset.
 python train.py trainset=kitti valset=kitti model=camliraft ckpt.path=checkpoint/vismoflow_initial.pt
 ```
 
-And set the training parameters in `kitti.yaml`:
+where we need to set the training parameters in `kitti.yaml`:
 
 ```
 # @package _global_
@@ -105,7 +105,7 @@ Stage 2: Training our model for multimodal-based scene flow using Event-KITTI da
 python train.py trainset=kitti_event valset=kitti_event model=vismoflow ckpt.path=checkpoint/vismoflow_evkitti.pt
 ```
 
-And set the training parameters in `kitti_event.yaml`:
+where we need to set the training parameters in `kitti_event.yaml`:
 
 ```
 # @package _global_
@@ -155,7 +155,7 @@ Stage 3: Training our model for multimodal-based scene flow using the processed 
 python train.py trainset=dsec valset=dsec model=vismoflow ckpt.path=checkpoint/vismoflow_dsec.pt
 ```
 
-And set the training parameters in `dsec.yaml`:
+where we need to set the training parameters in `dsec.yaml`:
 
 ```
 # @package _global_
