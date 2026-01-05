@@ -1,0 +1,12 @@
+# @package _global_
+valset:
+  name: kitti_event
+  root_dir: /mnt/data/zhouhanyu/CVPR2024/Dataset/data_scene_flow
+  split: training40
+  n_workers: 2
+
+  max_depth: 90
+  n_points: 8192
+
+  augmentation:
+    enabled: false

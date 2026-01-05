@@ -1,0 +1,103 @@
+# @package _global_
+defaults:
+ - _self_
+ - trainset: ???
+ - valset: ???
+ - model: ???
+ - training: ${trainset}/${model}
+
+log:
+  dir: null
+  ask_name: true
+  save_ckpt: true
+  save_scalar_summary: true
+  save_image_summary: false
+
+ckpt:
+  path: null
+  resume: false
+
+val_interval: 5
+port: random  # for multi-gpu training
+amp: false
+debug: false
+sync_bn: true
+
+
+reconstruction:
+  model_path: checkpoint/image_reconstruction.pth.tar
+  input_file: null
+  timestamps_file: null
+  output_folder: outputs/reconstruction
+  dataset_name: reconstruction
+  skipevents: 0
+  suboffset: 1
+  compute_voxel_grid_on_cpu: False
+  use_gpu: True
+  # Display
+  display: False
+  show_events: False
+  event_display_mode: red-blue # 'red-blue' or 'grayscale'
+  num_bins_to_show: -1
+  display_border_crop: 0
+  display_wait_time: 1
+  # filtering
+  hot_pixels_file: None
+  unsharp_mask_amount: 0.3
+  unsharp_mask_sigma: 1.0
+  bilateral_filter_sigma: 0.0
+  flip: False
+  # Tone mapping (i.e. rescaling of the image intensities)
+  Imin: 0.0
+  Imax: 1.0
+  auto_hdr: False
+  auto_hdr_median_filter_size: 10
+  color: False
+  no_normalize: False
+  no_recurrent: True
+  # reconstruction
+  
+
+
+HDR:
+  checkpoints_dir: ./checkpoint
+  gpu_ids: 0
+  name: event_video
+  # model parameters
+  im_type: event
+  model: video
+  netColor: video
+  colornet_n_blocks: 5
+  state_nc: 32
+  norm: instance
+  init_type: normal
+  init_gain: 0.02
+  no_dropout: False 
+  up_scale: 2
+  # dataset parameters
+  dataset_mode: test
+  serial_batches: True
+  num_threads: 4
+  batch_size: 1
+  no_flip: True
+  aspect_ratio: 1.0
+  phase: infer
+  eval: False 
+  num_test: 1000
+  isTrain: False
+  load_size: crop_size
+
+CloudInpainting:
+  root_dir: G:/CVPR_DSEC/Daytime
+  child_name: zurich_city_07_a
+  width: 640
+  height: 480
+  time_delta: 10000
+  baseline: 600
+  f: 569.2873535700672
+  cx: 336.2678413391113
+  cy: 222.2889060974121
+  max_depth: 120
+  min_depth: 0
+
+

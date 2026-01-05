@@ -1,0 +1,469 @@
+from __future__ import print_function, division
+import sys
+# sys.path.append('core')
+import math
+from typing import Dict, Tuple
+from pathlib import Path
+import weakref
+from skimage.transform import rotate, warp
+import h5py
+import argparse
+import os
+import cv2
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import imageio
+import hdf5plugin
+# os.environ['CUDA_VISIBLE_DEVICES'] = '0, 1'
+from skimage import io
+
+import numpy as np
+import torch 
+import open3d
+from utils import readFlowDSEC, project_pc2image
+from skimage.color import hsv2rgb
+from imageio import imwrite
+
+# 超像素分割
+from skimage.segmentation import slic,mark_boundaries
+from PIL import Image
+
+def flow2rgb(flow_map, max_value):
+    # 2 x H x w
+    h, w, _ = flow_map.shape
+    flow_u, flow_v = flow_map[:, :, 0], flow_map[:, :, 1]
+    n = 8
+    mag = np.sqrt(np.sum(np.square(flow_map), axis=2))
+    angle = np.arctan2(flow_v, flow_u)
+
+    im_h = np.mod(angle / (2 * np.pi) + 1.0, 1.0)
+    im_s = np.clip(mag * n / max_value, 0, 1)
+    im_v = np.clip(n - im_s, 0, 1)
+    im_hsv = np.stack((im_h, im_s, im_v), axis=2)
+
+    im = hsv2rgb(im_hsv)
+    return im
+
+
+class EventSlicer:
+    def __init__(self, h5f: h5py.File):
+        self.h5f = h5f
+
+        self.events = dict()
+        for dset_str in ['p', 'x', 'y', 't']:
+            self.events[dset_str] = self.h5f['events/{}'.format(dset_str)]
+
+        # This is the mapping from milliseconds to event index:
+        # It is defined such that
+        # (1) t[ms_to_idx[ms]] >= ms*1000
+        # (2) t[ms_to_idx[ms] - 1] < ms*1000
+        # ,where 'ms' is the time in milliseconds and 't' the event timestamps in microseconds.
+        #
+        # As an example, given 't' and 'ms':
+        # t:    0     500    2100    5000    5000    7100    7200    7200    8100    9000
+        # ms:   0       1       2       3       4       5       6       7       8       9
+        #
+        # we get
+        #
+        # ms_to_idx:
+        #       0       2       2       3       3       3       5       5       8       9
+        self.ms_to_idx = np.asarray(self.h5f['ms_to_idx'], dtype='int64')
+
+        self.t_offset = int(h5f['t_offset'][()])
+        self.t_final = int(self.events['t'][-1]) + self.t_offset
+
+    def get_final_time_us(self):
+        return self.t_final
+
+    def get_events(self, t_start_us: int, t_end_us: int) -> Dict[str, np.ndarray]:
+        """Get events (p, x, y, t) within the specified time window
+        Parameters
+        ----------
+        t_start_us: start time in microseconds
+        t_end_us: end time in microseconds
+        Returns
+        -------
+        events: dictionary of (p, x, y, t) or None if the time window cannot be retrieved
+        """
+        assert t_start_us < t_end_us
+
+        # We assume that the times are top-off-day, hence subtract offset:
+        t_start_us -= self.t_offset
+        t_end_us -= self.t_offset
+        # print(self.t_offset)
+        t_start_ms, t_end_ms = self.get_conservative_window_ms(t_start_us, t_end_us)
+        
+        t_start_ms_idx = self.ms2idx(t_start_ms)
+        t_end_ms_idx = self.ms2idx(t_end_ms)
+
+        if t_start_ms_idx is None or t_end_ms_idx is None:
+            # Cannot guarantee window size anymore
+            return None
+
+        events = dict()
+        time_array_conservative = np.asarray(self.events['t'][t_start_ms_idx:t_end_ms_idx])
+        idx_start_offset, idx_end_offset = self.get_time_indices_offsets(time_array_conservative, t_start_us, t_end_us)
+        t_start_us_idx = t_start_ms_idx + idx_start_offset
+        t_end_us_idx = t_start_ms_idx + idx_end_offset
+        # Again add t_offset to get gps time
+        events['t'] = time_array_conservative[idx_start_offset:idx_end_offset] + self.t_offset
+        for dset_str in ['p', 'x', 'y']:
+            events[dset_str] = np.asarray(self.events[dset_str][t_start_us_idx:t_end_us_idx])
+            assert events[dset_str].size == events['t'].size
+        return events
+
+
+    @staticmethod
+    def get_conservative_window_ms(ts_start_us: int, ts_end_us) -> Tuple[int, int]:
+        """Compute a conservative time window of time with millisecond resolution.
+        We have a time to index mapping for each millisecond. Hence, we need
+        to compute the lower and upper millisecond to retrieve events.
+        Parameters
+        ----------
+        ts_start_us:    start time in microseconds
+        ts_end_us:      end time in microseconds
+        Returns
+        -------
+        window_start_ms:    conservative start time in milliseconds
+        window_end_ms:      conservative end time in milliseconds
+        """
+        assert ts_end_us > ts_start_us
+        window_start_ms = math.floor(ts_start_us/1000)
+        window_end_ms = math.ceil(ts_end_us/1000)
+        return window_start_ms, window_end_ms
+    @staticmethod
+    # @jit(nopython=True)
+    def get_time_indices_offsets(
+            time_array: np.ndarray,
+            time_start_us: int,
+            time_end_us: int) -> Tuple[int, int]:
+        """Compute index offset of start and end timestamps in microseconds
+        Parameters
+        ----------
+        time_array:     timestamps (in us) of the events
+        time_start_us:  start timestamp (in us)
+        time_end_us:    end timestamp (in us)
+        Returns
+        -------
+        idx_start:  Index within this array corresponding to time_start_us
+        idx_end:    Index within this array corresponding to time_end_us
+        such that (in non-edge cases)
+        time_array[idx_start] >= time_start_us
+        time_array[idx_end] >= time_end_us
+        time_array[idx_start - 1] < time_start_us
+        time_array[idx_end - 1] < time_end_us
+        this means that
+        time_start_us <= time_array[idx_start:idx_end] < time_end_us
+        """
+
+        assert time_array.ndim == 1
+
+        idx_start = -1
+        if time_array[-1] < time_start_us:
+            # This can happen in extreme corner cases. E.g.
+            # time_array[0] = 1016
+            # time_array[-1] = 1984
+            # time_start_us = 1990
+            # time_end_us = 2000
+
+            # Return same index twice: array[x:x] is empty.
+            return time_array.size, time_array.size
+        else:
+            for idx_from_start in range(0, time_array.size, 1):
+                if time_array[idx_from_start] >= time_start_us:
+                    idx_start = idx_from_start
+                    break
+        assert idx_start >= 0
+
+        idx_end = time_array.size
+        for idx_from_end in range(time_array.size - 1, -1, -1):
+            if time_array[idx_from_end] >= time_end_us:
+                idx_end = idx_from_end
+            else:
+                break
+
+        assert time_array[idx_start] >= time_start_us
+        if idx_end < time_array.size:
+            assert time_array[idx_end] >= time_end_us
+        if idx_start > 0:
+            assert time_array[idx_start - 1] < time_start_us
+        if idx_end > 0:
+            assert time_array[idx_end - 1] < time_end_us
+        return idx_start, idx_end
+
+    def ms2idx(self, time_ms: int) -> int:
+        # print(time_ms)
+        assert time_ms >= 0
+        if time_ms >= self.ms_to_idx.size:
+            return None
+        return self.ms_to_idx[time_ms]
+
+
+def plot_points_on_background(points_coordinates,
+                              background,
+                              points_color=[0, 0, 255]):
+    """
+    Args:
+        points_coordinates: array of (y, x) points coordinates
+                            of size (number_of_points x 2).
+        background: (3 x height x width)
+                    gray or color image uint8.
+        color: color of points [red, green, blue] uint8.
+    """
+    if not (len(background.size()) == 3 and background.size(0) == 3):
+        raise ValueError('background should be (color x height x width).')
+    _, height, width = background.size()
+    background_with_points = background.clone()
+    y, x = points_coordinates.transpose(0, 1)
+    if len(x) > 0 and len(y) > 0: # There can be empty arrays!
+        x_min, x_max = x.min(), x.max()
+        y_min, y_max = y.min(), y.max()
+        if not (x_min >= 0 and y_min >= 0 and x_max < width and y_max < height):
+            raise ValueError('points coordinates are outsize of "background" '
+                             'boundaries.')
+        background_with_points[:, y, x] = torch.Tensor(points_color).type_as(
+            background).unsqueeze(-1)
+    return background_with_points
+
+def disp2pc(disp, baseline, f, cx, cy, flow=None):
+    h, w = disp.shape
+    depth = baseline * f / (disp + 1e-5)
+
+    xx = np.tile(np.arange(w, dtype=np.float32)[None, :], (h, 1))
+    yy = np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w))
+
+    if flow is None:
+        x = (xx - cx) * depth / f
+        y = (yy - cy) * depth / f
+    else:
+        x = (xx - cx + flow[..., 0]) * depth / f
+        y = (yy - cy + flow[..., 1]) * depth / f
+
+    pc = np.concatenate([
+        x[:, :, None],
+        y[:, :, None],
+        depth[:, :, None],
+    ], axis=-1)
+
+    return pc
+
+def depth2pc(depth, f, cx, cy, flow=None):
+    h, w = depth.shape
+    # depth = baseline * f / (disp + 1e-5)
+
+    xx = np.tile(np.arange(w, dtype=np.float32)[None, :], (h, 1))
+    yy = np.tile(np.arange(h, dtype=np.float32)[:, None], (1, w))
+
+    if flow is None:
+        x = (xx - cx) * depth / f
+        y = (yy - cy) * depth / f
+    else:
+        x = (xx - cx + flow[..., 0]) * depth / f
+        y = (yy - cy + flow[..., 1]) * depth / f
+
+    pc = np.concatenate([
+        x[:, :, None],
+        y[:, :, None],
+        depth[:, :, None],
+    ], axis=-1)
+
+    return pc
+
+def events_to_event_image(event_sequence, height, width, background=None, rotation_angle=None, crop_window=None,
+                          horizontal_flip=False, flip_before_crop=False):
+    polarity = event_sequence[:, 3] == -1.0
+    x_negative = event_sequence[~polarity, 1].astype(np.int)
+    y_negative = event_sequence[~polarity, 2].astype(np.int)
+    x_positive = event_sequence[polarity, 1].astype(np.int)
+    y_positive = event_sequence[polarity, 2].astype(np.int)
+
+    positive_histogram, _, _ = np.histogram2d(
+        x_positive,
+        y_positive,
+        bins=(width, height),
+        range=[[0, width], [0, height]])
+    negative_histogram, _, _ = np.histogram2d(
+        x_negative,
+        y_negative,
+        bins=(width, height),
+        range=[[0, width], [0, height]])
+
+    # Red -> Negative Events
+    red = np.transpose((negative_histogram >= positive_histogram) & (negative_histogram != 0))
+    # Blue -> Positive Events
+    blue = np.transpose(positive_histogram > negative_histogram)
+    # Normally, we flip first, before we apply the other data augmentations
+    if flip_before_crop:
+        if horizontal_flip:
+            red = np.flip(red, axis=1)
+            blue = np.flip(blue, axis=1)
+        # Rotate, if necessary
+        if rotation_angle is not None:
+            red = rotate(red, angle=rotation_angle, preserve_range=True).astype(bool)
+            blue = rotate(blue, angle=rotation_angle, preserve_range=True).astype(bool)
+        # Crop, if necessary
+        if crop_window is not None:
+            tf = transformers.RandomCropping(crop_height=crop_window['crop_height'],
+                                             crop_width=crop_window['crop_width'],
+                                             left_right=crop_window['left_right'],
+                                             shift=crop_window['shift'])
+            red = tf.crop_image(red, None, window=crop_window)
+            blue = tf.crop_image(blue, None, window=crop_window)
+    else:
+        # Rotate, if necessary
+        if rotation_angle is not None:
+            red = rotate(red, angle=rotation_angle, preserve_range=True).astype(bool)
+            blue = rotate(blue, angle=rotation_angle, preserve_range=True).astype(bool)
+        # Crop, if necessary
+        if crop_window is not None:
+            tf = transformers.RandomCropping(crop_height=crop_window['crop_height'],
+                                             crop_width=crop_window['crop_width'],
+                                             left_right=crop_window['left_right'],
+                                             shift=crop_window['shift'])
+            red = tf.crop_image(red, None, window=crop_window)
+            blue = tf.crop_image(blue, None, window=crop_window)
+        if horizontal_flip:
+            red = np.flip(red, axis=1)
+            blue = np.flip(blue, axis=1)
+
+    if background is None:
+        height, width = red.shape
+        # background = torch.full((3, height, width), 255).byte()
+        background = torch.full((3, height, width), 255, dtype=torch.long)
+        
+    if len(background.shape) == 2:
+        background = background.unsqueeze(0)
+    else:
+        if min(background.size()) == 1:
+            background = grayscale_to_rgb(background)
+        else:
+            if not isinstance(background, torch.Tensor):
+                background = torch.from_numpy(background)
+    points_on_background = plot_points_on_background(
+        torch.nonzero(torch.from_numpy(red.astype(np.uint8))), background,
+        [255, 0, 0])
+    points_on_background = plot_points_on_background(
+        torch.nonzero(torch.from_numpy(blue.astype(np.uint8))),
+        points_on_background, [0, 0, 255])
+    return points_on_background
+
+
+if __name__ == '__main__':
+
+    width = 640
+    height = 480
+
+    name = 'zurich_city_10_b'
+    dir_ = 'G:/CVPR_DSEC/Nighttime'
+    path = os.path.join(dir_, name)
+
+    ev_data_file = os.path.join(path, 'events/events.h5')
+    ev_location = h5py.File(str(ev_data_file), 'r')
+    events_slicer = EventSlicer(ev_location)
+    time_delta = 10000
+    frame_id = 0
+    files = sorted(os.listdir(os.path.join(path, 'disparity/event')))
+    # 创建文件夹
+    os.mkdir(os.path.join(path, 'cluster'))
+    os.mkdir(os.path.join(path, 'cluster/event'))
+    os.mkdir(os.path.join(path, 'cluster/fused_depth'))
+    os.mkdir(os.path.join(path, 'cluster/origin_depth'))
+    os.mkdir(os.path.join(path, 'enhanced_depth'))
+    os.mkdir(os.path.join(path, 'enhanced_point_cloud'))
+    
+    with open(os.path.join(path, 'disparity/timestamps.txt'), 'r') as file:
+        lines = file.readlines()
+        for index in range(len(files)):
+            line = lines[index]
+
+            print(files[index])
+            timestamp = int(line)
+            events = events_slicer.get_events(timestamp, timestamp+time_delta)
+
+            p = events['p'].astype(np.int8)
+            t = events['t'].astype(np.float64)
+            x = events['x']
+            y = events['y']
+            p = 2*p - 1
+
+            events_rectified = np.stack([t, x, y, p], axis=-1)
+            
+            event_image = events_to_event_image(
+                event_sequence=events_rectified,
+                height=480,
+                width=640
+            ).numpy()
+            save_name = os.path.join(path + '/event_frame', files[index])
+            # imageio.imsave(save_name, event_image.transpose(1,2,0))
+            
+
+            # save depth
+            disp = io.imread(os.path.join(os.path.join(path, 'disparity/event'), files[index]))
+            pc = disp2pc(disp, baseline=600, f=569.2873535700672, cx=336.2678413391113, cy=222.2889060974121)
+            # disp2 = io.imread(os.path.join(os.path.join(path, 'disparity/event'), files[index+1]))
+            depth = 600 * 569.2873535700672 / (disp + 1e-5)
+            mask = (depth[:,:] < 120)
+            depth = depth*mask
+            # cv2.imwrite(os.path.join(os.path.join(path, 'depth'), files[index]), (100.0*depth).astype(np.uint16))
+
+
+            # 聚类
+            # print(event_image.shape)
+            img = cv2.imread(os.path.join(os.path.join(path, 'event_frame'), files[index]))
+            # img = img.transpose(1,2,0)
+            # DBSCAN()
+            slic = cv2.ximgproc.createSuperpixelSLIC(img, cv2.ximgproc.SLIC, region_size=10, ruler=20.0) 
+            slic.iterate(10)     # 迭代次数，越大效果越好
+            mask_slic = slic.getLabelContourMask()     # 获取Mask，超像素边缘Mask==1
+            label_slic = slic.getLabels()     # 获取超像素标签
+            # 邻域构建
+            mask_inv_slic = cv2.bitwise_not(mask_slic)  
+            img_slic = cv2.bitwise_and(img,img,mask =  mask_inv_slic) #在原图上绘制超像素边界
+
+            color_img = np.zeros((img.shape[0], img.shape[1], 3), np.uint8)
+            color_img[:] = (0, 0 , 0)
+            result_ = cv2.bitwise_and(color_img, color_img, mask=mask_slic)
+            result = cv2.add(img_slic, result_)
+            cv2.imwrite(os.path.join(os.path.join(path, 'cluster/event'), files[index]), result)
+
+            # 深度融合
+            filled_image = np.zeros_like(depth)
+            # number_slic = slic.getNumberOfSuperpixels()     # 获取超像素数目
+            mask = (img[:,:, 1] == 0)
+            # mask = 
+            for label in np.unique(label_slic):
+                y, x = np.where(label_slic == label)
+                # 计算当前区域的深度均值
+                non_zero_depth = depth[y, x][depth[y, x] > 0]
+                if len(non_zero_depth) > 0:
+                    mean_depth = np.mean(non_zero_depth)
+                    filled_image[y, x] = mean_depth
+            # print(filled_image.shape)
+            filled_depth = mask * filled_image
+            fuse_mask = (depth[:, :] == 0)
+            fused_depth = filled_depth * fuse_mask + depth
+            # print('d1: %d, d2: %d' % (depth[300, 300], fused_depth[300, 300]))
+            # cv2.imshow('Filled Depth Image', filled_image)
+            # cv2.imwrite(os.path.join(os.path.join(path, 'cluster/depth'), files[index]), filled_image)
+            cv2.imwrite(os.path.join(os.path.join(path, 'enhanced_depth'), files[index]), (100.0*fused_depth).astype(np.uint16))
+
+            fused_pc = depth2pc(fused_depth, f=569.2873535700672, cx=336.2678413391113, cy=222.2889060974121)
+            mask = (fused_pc[..., -1] < 120)
+            fused_pc = fused_pc[mask]
+            point_cloud = open3d.geometry.PointCloud()
+            point_cloud.points = open3d.utility.Vector3dVector(fused_pc)
+            open3d.io.write_point_cloud(os.path.join(os.path.join(path, 'enhanced_point_cloud'), files[index][:-4]+'.pcd'), point_cloud)
+            # open3d.visualization.draw_geometries([point_cloud])
+            # cv2.waitkey(0)
+
+            gray_depth_image_before = (255 * (depth - 0) / (120 - 0)).astype(np.uint8)
+            gray_depth_image_after = (255 * (fused_depth - 0) / (120 - 0)).astype(np.uint8)
+            im_color_before=cv2.applyColorMap(gray_depth_image_before,cv2.COLORMAP_BONE)
+            im_color_after=cv2.applyColorMap(gray_depth_image_after,cv2.COLORMAP_BONE)
+            im_before=Image.fromarray(im_color_before)
+            im_after=Image.fromarray(im_color_after)
+            im_before.save(os.path.join(os.path.join(path, 'cluster/origin_depth'), files[index]))
+            im_after.save(os.path.join(os.path.join(path, 'cluster/fused_depth'), files[index]))
+            
